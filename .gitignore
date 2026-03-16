@@ -24,6 +24,9 @@ runs/
 # Personal
 resume_bullets.html
 
+# Claude Code context
+CLAUDE.md
+
 # macOS
 .DS_Store
 
