@@ -1,0 +1,33 @@
+# Datasets
+data/
+
+# Model checkpoints
+ckpts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+runs/
+*.log
+
+# Personal
+resume_bullets.html
+
+# macOS
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
