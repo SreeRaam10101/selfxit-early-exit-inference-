@@ -45,8 +45,15 @@ import torchvision.transforms as T
 try:
     from torch.utils.tensorboard import SummaryWriter
     _TB_AVAILABLE = True
-except ImportError:
+except Exception:
     _TB_AVAILABLE = False
+
+try:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    _PLOT_AVAILABLE = True
+except Exception:
+    _PLOT_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +521,57 @@ class EarlyExitResNet(nn.Module):
 #  Training
 # ---------------------------------------------------------------------------
 
+def calibrate_temperature(model: EarlyExitResNet,
+                          valloader: DataLoader,
+                          device: torch.device) -> List[float]:
+    """
+    Post-training temperature scaling: find per-exit scalar T that minimises
+    NLL on the validation set via L-BFGS. Stores results in model.exit_temperatures.
+    Returns the list of temperatures [T_exit0, T_exit1, ..., T_backbone].
+    """
+    model.eval()
+    model.to(device)
+    n_exits = model.num_exits + 1
+
+    # Collect all logits and labels per exit point
+    all_logits: List[List[torch.Tensor]] = [[] for _ in range(n_exits)]
+    all_labels: List[List[torch.Tensor]] = [[] for _ in range(n_exits)]
+
+    with torch.no_grad():
+        for images, targets in valloader:
+            images, targets = images.to(device), targets.to(device)
+            exit_logits_list, final_logits = model.forward_with_exits(images)
+            for i, logits in enumerate(exit_logits_list):
+                all_logits[i].append(logits.cpu())
+                all_labels[i].append(targets.cpu())
+            all_logits[model.num_exits].append(final_logits.cpu())
+            all_labels[model.num_exits].append(targets.cpu())
+
+    temperatures: List[float] = []
+    nll = nn.CrossEntropyLoss()
+
+    for i in range(n_exits):
+        logits_cat = torch.cat(all_logits[i])
+        labels_cat = torch.cat(all_labels[i])
+        T = nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.LBFGS([T], lr=0.01, max_iter=50)
+
+        def closure():
+            optimizer.zero_grad()
+            loss = nll(logits_cat / T, labels_cat)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        T_val = max(T.item(), 0.1)  # clamp: T must be positive
+        temperatures.append(T_val)
+        label = f"Exit {i}" if i < model.num_exits else "Backbone"
+        print(f"  [Calibrate] {label}: T = {T_val:.4f}")
+
+    model.exit_temperatures = temperatures
+    return temperatures
+
+
 def freeze(model: EarlyExitResNet):
     for p in model.backbone.parameters():
         p.requires_grad_(False)
@@ -588,7 +646,13 @@ def train_joint(model: EarlyExitResNet,
     if epochs == 0:
         print("[Joint] Skipping (epochs=0).")
         return
-    print(f"[Joint] Training {epochs} epochs, lr={lr}, exit_weight={exit_loss_weight}")
+    # Depth-weighted supervision: earlier exits are harder → more weight.
+    # Linear schedule: exit 0 → exit_loss_weight, last exit → exit_loss_weight/num_exits.
+    # Average across exits equals exit_loss_weight, so the hyperparameter meaning is preserved.
+    n = model.num_exits
+    depth_weights = [exit_loss_weight * (n - i) / n for i in range(n)]
+    print(f"[Joint] Training {epochs} epochs, lr={lr}, "
+          f"exit_weights={[f'{w:.3f}' for w in depth_weights]}")
     model.to(device)
     unfreeze(model)
 
@@ -613,8 +677,8 @@ def train_joint(model: EarlyExitResNet,
             exit_logits_list, final_logits = model.forward_with_exits(images)
 
             loss = criterion(final_logits, targets)
-            for exit_logits in exit_logits_list:
-                loss = loss + exit_loss_weight * criterion(exit_logits, targets)
+            for i, exit_logits in enumerate(exit_logits_list):
+                loss = loss + depth_weights[i] * criterion(exit_logits, targets)
 
             optimizer.zero_grad()
             loss.backward()
@@ -921,10 +985,11 @@ def pareto_sweep(model: EarlyExitResNet,
                  policy: str,
                  mac_profile: Optional[MACProfile],
                  tau_values: Optional[List[float]] = None,
-                 threshold_values: Optional[List[float]] = None):
+                 threshold_values: Optional[List[float]] = None,
+                 ) -> List[Dict]:
     """
     Sweep tau (static) or gate_threshold (dynamic) and print the
-    accuracy–FLOPs Pareto frontier.
+    accuracy–FLOPs Pareto frontier. Returns collected points for plotting.
     """
     if policy == "static":
         values = tau_values or [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99]
@@ -940,6 +1005,7 @@ def pareto_sweep(model: EarlyExitResNet,
     print(header)
     print("  " + "-" * (len(header) - 2))
 
+    points: List[Dict] = []
     for v in values:
         if policy == "static":
             r = evaluate_policy(model, testloader, device, "static",
@@ -949,6 +1015,117 @@ def pareto_sweep(model: EarlyExitResNet,
                                 gate_threshold=v, mac_profile=mac_profile)
         flops_str = f"{r.avg_flops_fraction*100:.1f}" if r.avg_flops_fraction else "n/a"
         print(f"  {v:<18.3f}  {r.accuracy:6.2f}   {flops_str:>7}   {r.avg_latency_ms:.2f}")
+        if r.avg_flops_fraction:
+            points.append({
+                "threshold": v,
+                "accuracy": r.accuracy,
+                "flops_pct": r.avg_flops_fraction * 100,
+                "latency_ms": r.avg_latency_ms,
+            })
+    return points
+
+
+def plot_pareto_curves(static_pts: List[Dict],
+                       dynamic_pts: List[Dict],
+                       plot_dir: str,
+                       dataset: str = "") -> None:
+    """Save accuracy vs FLOPs Pareto curve to plot_dir/pareto.png."""
+    if not _PLOT_AVAILABLE:
+        print("[Plot] matplotlib/numpy not available — skipping Pareto plot.")
+        return
+    os.makedirs(plot_dir, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    title_suffix = f" — {dataset}" if dataset else ""
+
+    for ax, pts, label, color in [
+        (axes[0], static_pts,  "Static (τ sweep)",        "steelblue"),
+        (axes[1], dynamic_pts, "Dynamic (gate threshold)", "darkorange"),
+    ]:
+        if not pts:
+            ax.set_title(f"{label}\n(no FLOPs data)")
+            continue
+        xs = [p["flops_pct"] for p in pts]
+        ys = [p["accuracy"]  for p in pts]
+        ax.plot(xs, ys, "o-", color=color, linewidth=2, markersize=6)
+        for p in pts:
+            ax.annotate(f"{p['threshold']:.2f}",
+                        (p["flops_pct"], p["accuracy"]),
+                        textcoords="offset points", xytext=(4, 4), fontsize=7)
+        ax.set_xlabel("Avg FLOPs (%)")
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_title(f"{label}{title_suffix}")
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"SelfXit Accuracy–Compute Pareto{title_suffix}", fontsize=13)
+    fig.tight_layout()
+    out_path = os.path.join(plot_dir, "pareto.png")
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[Plot] Pareto curve saved → {out_path}")
+
+
+def plot_difficulty_analysis(model: EarlyExitResNet,
+                             testloader: DataLoader,
+                             device: torch.device,
+                             policy: str,
+                             plot_dir: str,
+                             dataset: str = "",
+                             tau: float = 0.9,
+                             gate_threshold: float = 0.8) -> None:
+    """
+    Validate the gate hypothesis: easy samples (large logit margin) exit early,
+    hard samples (small margin) reach the full backbone.
+    Plots a violin chart of logit margin distribution per exit point.
+    """
+    if not _PLOT_AVAILABLE:
+        print("[Plot] matplotlib/numpy not available — skipping difficulty analysis.")
+        return
+
+    model.eval()
+    model.to(device)
+    n_exits = model.num_exits + 1
+    per_exit_margins: Dict[int, List[float]] = {i: [] for i in range(n_exits)}
+
+    with torch.no_grad():
+        for images, _ in testloader:
+            images = images.to(device)
+            if policy == "static":
+                logits_out, exit_ids = model.inference_static(images, tau=tau)
+            else:
+                logits_out, exit_ids = model.inference_dynamic(
+                    images, gate_threshold=gate_threshold)
+            top2 = torch.topk(logits_out, k=2, dim=1).values
+            margins = (top2[:, 0] - top2[:, 1]).cpu().tolist()
+            for margin, eid in zip(margins, exit_ids.cpu().tolist()):
+                per_exit_margins[eid].append(margin)
+
+    labels = [f"Exit {i}\n(layer{model.exit_layers[i]})"
+              for i in range(model.num_exits)] + ["Full\nbackbone"]
+    data = [per_exit_margins[i] for i in range(n_exits)]
+    non_empty = [(lbl, d) for lbl, d in zip(labels, data) if d]
+    if not non_empty:
+        print("[Plot] No samples collected for difficulty analysis.")
+        return
+
+    os.makedirs(plot_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    vp = ax.violinplot([d for _, d in non_empty], showmedians=True)
+    for body in vp["bodies"]:
+        body.set_alpha(0.7)
+    ax.set_xticks(range(1, len(non_empty) + 1))
+    ax.set_xticklabels([lbl for lbl, _ in non_empty])
+    ax.set_ylabel("Logit margin (top-1 − top-2)")
+    ax.set_xlabel("Exit point")
+    title_suffix = f" — {dataset}" if dataset else ""
+    ax.set_title(f"Sample Difficulty vs Exit Depth{title_suffix}\n"
+                 f"(higher margin = more confident = easier)")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    out_path = os.path.join(plot_dir, "difficulty.png")
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[Plot] Difficulty analysis saved → {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1024,6 +1201,71 @@ def load_checkpoint(model: EarlyExitResNet, path: str, tag: str = "model",
 #  Main
 # ---------------------------------------------------------------------------
 
+def benchmark_single_sample(model: EarlyExitResNet,
+                            testloader: DataLoader,
+                            device: torch.device,
+                            policy: str,
+                            n_runs: int = 1000,
+                            tau: float = 0.9,
+                            gate_threshold: float = 0.8) -> None:
+    """
+    Run n_runs single-sample forward passes and report P50/P95/P99 latency,
+    broken down by which exit was taken.
+    Batch-size-1 latency is the metric that matters for online serving.
+    """
+    if not _PLOT_AVAILABLE:
+        print("[Benchmark] numpy not available — skipping single-sample benchmark.")
+        return
+
+    model.eval()
+    model.to(device)
+
+    # Collect all test images into a flat list for random sampling
+    all_images: List[torch.Tensor] = []
+    for imgs, _ in testloader:
+        for img in imgs:
+            all_images.append(img)
+
+    import random
+    latencies: List[float] = []
+    exit_taken: List[int] = []
+    n_exits = model.num_exits + 1  # exits + final backbone
+
+    with torch.no_grad():
+        for _ in range(n_runs):
+            img = random.choice(all_images).unsqueeze(0).to(device)
+            t0 = time.perf_counter()
+            if policy == "static":
+                _, eid = model.inference_static(img, tau=tau)
+            else:
+                _, eid = model.inference_dynamic(img, gate_threshold=gate_threshold)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            latencies.append((time.perf_counter() - t0) * 1000)
+            exit_taken.append(eid[0].item())
+
+    lats = np.array(latencies)
+    exits = np.array(exit_taken)
+
+    print(f"\n{'='*60}")
+    print(f"Single-Sample Latency Benchmark  (policy={policy}, n={n_runs})")
+    print(f"{'='*60}")
+    print(f"  Overall   P50={np.percentile(lats,50):.2f}ms  "
+          f"P95={np.percentile(lats,95):.2f}ms  "
+          f"P99={np.percentile(lats,99):.2f}ms")
+    print()
+    labels = [f"Exit {i}" for i in range(model.num_exits)] + ["Full backbone"]
+    for e in range(n_exits):
+        mask = exits == e
+        if mask.sum() == 0:
+            continue
+        e_lats = lats[mask]
+        pct = mask.sum() / n_runs * 100
+        print(f"  {labels[e]:<14} ({pct:5.1f}% of samples)  "
+              f"P50={np.percentile(e_lats,50):.2f}ms  "
+              f"P95={np.percentile(e_lats,95):.2f}ms")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SelfXit v2 — Extended Early-Exit ResNet",
@@ -1089,10 +1331,20 @@ def main():
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--sweep", action="store_true",
                         help="Run Pareto sweep over threshold values.")
+    parser.add_argument("--plot_dir", type=str, default=None,
+                        help="Directory to save Pareto plot (requires --sweep).")
     parser.add_argument("--per_class", action="store_true",
                         help="Print per-class exit analysis after evaluation.")
     parser.add_argument("--top_k_classes", type=int, default=10,
                         help="How many earliest/latest classes to print.")
+    parser.add_argument("--benchmark_single", action="store_true",
+                        help="Run single-sample (batch=1) latency benchmark.")
+    parser.add_argument("--benchmark_n_runs", type=int, default=1000,
+                        help="Number of single-sample runs for --benchmark_single.")
+    parser.add_argument("--difficulty_plot", action="store_true",
+                        help="Plot logit margin vs exit depth (requires --plot_dir).")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Run per-exit temperature scaling calibration after training.")
 
     # Checkpoints / logging
     parser.add_argument("--checkpoint_dir", type=str, default=None,
@@ -1157,6 +1409,11 @@ def main():
         if args.checkpoint_dir:
             save_checkpoint(model, args.checkpoint_dir)
 
+    # ---- Temperature scaling calibration --------------------------------
+    if args.calibrate:
+        print("\n[Calibrate] Running per-exit temperature scaling...")
+        calibrate_temperature(model, testloader, device)
+
     # ---- MAC profiling --------------------------------------------------
     mac_profile: Optional[MACProfile] = None
     try:
@@ -1179,13 +1436,18 @@ def main():
         )
 
     # ---- Pareto sweep ---------------------------------------------------
+    static_pts: List[Dict] = []
+    dynamic_pts: List[Dict] = []
     if args.sweep:
         if args.policy in ("static", "both"):
-            pareto_sweep(model, testloader, device, "static",
-                         mac_profile=mac_profile)
+            static_pts = pareto_sweep(model, testloader, device, "static",
+                                      mac_profile=mac_profile)
         if args.policy in ("dynamic", "both"):
-            pareto_sweep(model, testloader, device, "dynamic",
-                         mac_profile=mac_profile)
+            dynamic_pts = pareto_sweep(model, testloader, device, "dynamic",
+                                       mac_profile=mac_profile)
+        if args.plot_dir:
+            plot_pareto_curves(static_pts, dynamic_pts,
+                               args.plot_dir, dataset=args.dataset)
 
     # ---- Standard evaluation --------------------------------------------
     print("\n" + "=" * 60)
@@ -1211,6 +1473,25 @@ def main():
         print_result(r, model)
         if args.per_class:
             print_per_class_analysis(r, model, top_k=args.top_k_classes)
+
+    # ---- Difficulty analysis plot ---------------------------------------
+    if args.difficulty_plot and args.plot_dir:
+        diff_policy = "dynamic" if args.policy == "dynamic" else "static"
+        plot_difficulty_analysis(model, testloader, device,
+                                 policy=diff_policy,
+                                 plot_dir=args.plot_dir,
+                                 dataset=args.dataset,
+                                 tau=args.tau,
+                                 gate_threshold=gate_threshold)
+
+    # ---- Single-sample latency benchmark --------------------------------
+    if args.benchmark_single:
+        bench_policy = "dynamic" if args.policy == "dynamic" else "static"
+        benchmark_single_sample(model, testloader, device,
+                                policy=bench_policy,
+                                n_runs=args.benchmark_n_runs,
+                                tau=args.tau,
+                                gate_threshold=gate_threshold)
 
     logger.close()
 
