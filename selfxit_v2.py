@@ -428,6 +428,32 @@ class EarlyExitResNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)
 
+    def _cascade_steps(self, x: torch.Tensor):
+        """
+        Lazily run the backbone layer-by-layer for a single sample (B == 1).
+
+        Yields (exit_idx, logits, feat) for each configured exit head, in
+        order, then a final (num_exits, final_logits, None) for the backbone
+        head. Because this is a generator, layers after the one a consumer
+        stops at are never executed.
+        """
+        out = self.backbone.conv1(x)
+        out = self.backbone.bn1(out)
+        out = self.backbone.relu(out)
+        out = self.backbone.maxpool(out)
+
+        exit_map = {l: i for i, l in enumerate(self.exit_layers)}
+        for layer_idx in range(1, 5):
+            out = getattr(self.backbone, f"layer{layer_idx}")(out)
+            if layer_idx in exit_map:
+                exit_idx = exit_map[layer_idx]
+                logits = self.exit_heads[exit_idx](out)
+                yield exit_idx, logits, out
+
+        pooled = torch.flatten(self.backbone.avgpool(out), 1)
+        final_logits = self.backbone.fc(pooled)
+        yield self.num_exits, final_logits, None
+
     # ---- gate features --------------------------------------------------
 
     def _gate_features(self, probs: torch.Tensor,
@@ -449,11 +475,30 @@ class EarlyExitResNet(nn.Module):
 
     def inference_static(self, x: torch.Tensor,
                          tau: float = 0.9,
-                         tau_entropy: Optional[float] = None
+                         tau_entropy: Optional[float] = None,
+                         cascade: bool = False
                          ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Exit when max_conf >= tau (and optionally entropy <= tau_entropy).
+
+        cascade=True: batch_size==1 only. Runs the backbone layer-by-layer
+        via _cascade_steps and returns as soon as an exit fires, so layers
+        after the exit point are never executed.
         """
+        if cascade:
+            assert x.size(0) == 1, "cascade=True only supports batch size 1"
+            for exit_idx, logits, _ in self._cascade_steps(x):
+                if exit_idx == self.num_exits:
+                    return logits, torch.tensor([exit_idx], device=x.device)
+                probs = F.softmax(logits, 1)
+                max_conf, _ = probs.max(1)
+                condition = max_conf >= tau
+                if tau_entropy is not None:
+                    ent = entropy_from_probs(probs)
+                    condition = condition & (ent <= tau_entropy)
+                if condition.item():
+                    return logits, torch.tensor([exit_idx], device=x.device)
+
         B = x.size(0)
         num_cls = self.backbone.fc.out_features
         logits_out = torch.zeros(B, num_cls, device=x.device)
@@ -483,11 +528,28 @@ class EarlyExitResNet(nn.Module):
         return logits_out, exit_ids
 
     def inference_dynamic(self, x: torch.Tensor,
-                          gate_threshold: float = 0.8
+                          gate_threshold: float = 0.8,
+                          cascade: bool = False
                           ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Gate MLP decides exit at each checkpoint.
+
+        cascade=True: batch_size==1 only. Runs the backbone layer-by-layer
+        via _cascade_steps and returns as soon as the gate fires, so layers
+        after the exit point are never executed.
         """
+        if cascade:
+            assert x.size(0) == 1, "cascade=True only supports batch size 1"
+            for exit_idx, logits, feat in self._cascade_steps(x):
+                if exit_idx == self.num_exits:
+                    return logits, torch.tensor([exit_idx], device=x.device)
+                probs = F.softmax(logits, 1)
+                dnorm = (exit_idx + 1) / self.num_exits
+                feats = self._gate_features(probs, logits, dnorm)
+                gate_prob = torch.sigmoid(self.gates[exit_idx](feats))
+                if (gate_prob >= gate_threshold).item():
+                    return logits, torch.tensor([exit_idx], device=x.device)
+
         B = x.size(0)
         num_cls = self.backbone.fc.out_features
         logits_out = torch.zeros(B, num_cls, device=x.device)
@@ -1210,7 +1272,12 @@ def benchmark_single_sample(model: EarlyExitResNet,
                             gate_threshold: float = 0.8) -> None:
     """
     Run n_runs single-sample forward passes and report P50/P95/P99 latency,
-    broken down by which exit was taken.
+    broken down by which exit was taken, for both the full-backbone
+    (cascade=False) and early-stop (cascade=True) inference paths.
+
+    Every run also checks that cascade and non-cascade agree (same exit_id,
+    allclose logits) — this is the correctness guard for the lazy
+    layer-by-layer path in _cascade_steps.
     Batch-size-1 latency is the metric that matters for online serving.
     """
     if not _PLOT_AVAILABLE:
@@ -1227,43 +1294,67 @@ def benchmark_single_sample(model: EarlyExitResNet,
             all_images.append(img)
 
     import random
-    latencies: List[float] = []
-    exit_taken: List[int] = []
     n_exits = model.num_exits + 1  # exits + final backbone
+
+    def run_inference(img: torch.Tensor, cascade: bool):
+        if policy == "static":
+            return model.inference_static(img, tau=tau, cascade=cascade)
+        return model.inference_dynamic(img, gate_threshold=gate_threshold, cascade=cascade)
+
+    results: Dict[bool, Dict[str, List]] = {
+        False: {"latencies": [], "exits": []},
+        True: {"latencies": [], "exits": []},
+    }
 
     with torch.no_grad():
         for _ in range(n_runs):
             img = random.choice(all_images).unsqueeze(0).to(device)
+
             t0 = time.perf_counter()
-            if policy == "static":
-                _, eid = model.inference_static(img, tau=tau)
-            else:
-                _, eid = model.inference_dynamic(img, gate_threshold=gate_threshold)
+            logits_full, eid_full = run_inference(img, cascade=False)
             if device.type == "cuda":
                 torch.cuda.synchronize()
-            latencies.append((time.perf_counter() - t0) * 1000)
-            exit_taken.append(eid[0].item())
+            results[False]["latencies"].append((time.perf_counter() - t0) * 1000)
+            results[False]["exits"].append(eid_full[0].item())
 
-    lats = np.array(latencies)
-    exits = np.array(exit_taken)
+            t0 = time.perf_counter()
+            logits_cascade, eid_cascade = run_inference(img, cascade=True)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            results[True]["latencies"].append((time.perf_counter() - t0) * 1000)
+            results[True]["exits"].append(eid_cascade[0].item())
 
-    print(f"\n{'='*60}")
-    print(f"Single-Sample Latency Benchmark  (policy={policy}, n={n_runs})")
-    print(f"{'='*60}")
-    print(f"  Overall   P50={np.percentile(lats,50):.2f}ms  "
-          f"P95={np.percentile(lats,95):.2f}ms  "
-          f"P99={np.percentile(lats,99):.2f}ms")
-    print()
+            assert eid_cascade.item() == eid_full.item(), (
+                f"cascade/non-cascade exit mismatch: "
+                f"{eid_cascade.item()} vs {eid_full.item()}")
+            assert torch.allclose(logits_cascade, logits_full, atol=1e-5), (
+                "cascade/non-cascade logits mismatch")
+
     labels = [f"Exit {i}" for i in range(model.num_exits)] + ["Full backbone"]
-    for e in range(n_exits):
-        mask = exits == e
-        if mask.sum() == 0:
-            continue
-        e_lats = lats[mask]
-        pct = mask.sum() / n_runs * 100
-        print(f"  {labels[e]:<14} ({pct:5.1f}% of samples)  "
-              f"P50={np.percentile(e_lats,50):.2f}ms  "
-              f"P95={np.percentile(e_lats,95):.2f}ms")
+
+    def print_table(title: str, latencies: List[float], exit_taken: List[int]):
+        lats = np.array(latencies)
+        exits = np.array(exit_taken)
+        print(f"\n{'='*60}")
+        print(f"Single-Sample Latency Benchmark — {title}  (policy={policy}, n={n_runs})")
+        print(f"{'='*60}")
+        print(f"  Overall   P50={np.percentile(lats,50):.2f}ms  "
+              f"P95={np.percentile(lats,95):.2f}ms  "
+              f"P99={np.percentile(lats,99):.2f}ms")
+        print()
+        for e in range(n_exits):
+            mask = exits == e
+            if mask.sum() == 0:
+                continue
+            e_lats = lats[mask]
+            pct = mask.sum() / n_runs * 100
+            print(f"  {labels[e]:<14} ({pct:5.1f}% of samples)  "
+                  f"P50={np.percentile(e_lats,50):.2f}ms  "
+                  f"P95={np.percentile(e_lats,95):.2f}ms  "
+                  f"P99={np.percentile(e_lats,99):.2f}ms")
+
+    print_table("full backbone (no cascade)", results[False]["latencies"], results[False]["exits"])
+    print_table("cascade (early-stop)", results[True]["latencies"], results[True]["exits"])
 
 
 def main():
