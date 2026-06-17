@@ -55,6 +55,14 @@ try:
 except Exception:
     _PLOT_AVAILABLE = False
 
+try:
+    from selfxit_kernels import gate_features_triton
+    _TRITON_AVAILABLE = True
+except Exception:
+    _TRITON_AVAILABLE = False
+
+_USE_TRITON_GATE = False  # set True via --triton_gate at runtime
+
 
 # ---------------------------------------------------------------------------
 #  Logger
@@ -484,6 +492,8 @@ class EarlyExitResNet(nn.Module):
     def _gate_features(self, probs: torch.Tensor,
                        logits: torch.Tensor,
                        depth_norm: float) -> torch.Tensor:
+        if _USE_TRITON_GATE and _TRITON_AVAILABLE and probs.is_cuda:
+            return gate_features_triton(probs, logits, depth_norm)
         with torch.no_grad():
             max_conf, _ = probs.max(1)
             ent = entropy_from_probs(probs)
@@ -1484,6 +1494,8 @@ def main():
                         help="TensorBoard log directory.")
     parser.add_argument("--channels_last", action="store_true",
                         help="Use NHWC (channels_last) memory format for ~33%% throughput gain on NVIDIA GPUs.")
+    parser.add_argument("--triton_gate", action="store_true",
+                        help="Use fused Triton kernel for gate feature computation (CUDA only).")
 
     args = parser.parse_args()
 
@@ -1498,6 +1510,16 @@ def main():
         trainloader = _channels_last_loader(trainloader)
         testloader  = _channels_last_loader(testloader)
         print("[channels_last] DataLoaders wrapped for NHWC format.")
+
+    if args.triton_gate:
+        if _TRITON_AVAILABLE and device.type == "cuda":
+            global _USE_TRITON_GATE
+            _USE_TRITON_GATE = True
+            print("[Triton] Gate feature kernel enabled.")
+        else:
+            print("[Triton] Warning: --triton_gate requested but "
+                  f"{'Triton not installed' if not _TRITON_AVAILABLE else 'device is not CUDA'}. "
+                  "Falling back to PyTorch.")
     cifar_stem = args.cifar_stem and args.dataset != "tinyimagenet"
     if args.dataset == "tinyimagenet":
         cifar_stem = True   # still use 3×3 stem but keep maxpool (handled inside backbone)
