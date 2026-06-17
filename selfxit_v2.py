@@ -288,6 +288,18 @@ def _tinyimagenet_loaders(data_root: str, batch_size: int,
             DataLoader(testset,  shuffle=False, **kwargs))
 
 
+def _channels_last_loader(loader: DataLoader) -> DataLoader:
+    """Wrap a DataLoader so every image batch is emitted in channels_last format."""
+    class _CLLoader:
+        def __init__(self, l): self._l = l
+        def __iter__(self):
+            for imgs, lbls in self._l:
+                yield imgs.to(memory_format=torch.channels_last), lbls
+        def __len__(self): return len(self._l)
+        def __getattr__(self, k): return getattr(self._l, k)
+    return _CLLoader(loader)
+
+
 def get_loaders(args) -> Tuple[DataLoader, DataLoader, int, Tuple[int, ...]]:
     """Returns (trainloader, testloader, num_classes, input_shape)."""
     if args.dataset in ("cifar10", "cifar100"):
@@ -454,6 +466,19 @@ class EarlyExitResNet(nn.Module):
         final_logits = self.backbone.fc(pooled)
         yield self.num_exits, final_logits, None
 
+    # ---- temperature helpers --------------------------------------------
+
+    def _get_temperature(self, exit_idx: int) -> float:
+        """Return calibration temperature for exit_idx (1.0 if not calibrated)."""
+        temps = getattr(self, 'exit_temperatures', None)
+        if temps is None or exit_idx >= len(temps):
+            return 1.0
+        return float(temps[exit_idx])
+
+    def _scaled_probs(self, logits: torch.Tensor, exit_idx: int) -> torch.Tensor:
+        T = self._get_temperature(exit_idx)
+        return F.softmax(logits / T, 1)
+
     # ---- gate features --------------------------------------------------
 
     def _gate_features(self, probs: torch.Tensor,
@@ -490,7 +515,7 @@ class EarlyExitResNet(nn.Module):
             for exit_idx, logits, _ in self._cascade_steps(x):
                 if exit_idx == self.num_exits:
                     return logits, torch.tensor([exit_idx], device=x.device)
-                probs = F.softmax(logits, 1)
+                probs = self._scaled_probs(logits, exit_idx)
                 max_conf, _ = probs.max(1)
                 condition = max_conf >= tau
                 if tau_entropy is not None:
@@ -508,7 +533,7 @@ class EarlyExitResNet(nn.Module):
         decided = torch.zeros(B, dtype=torch.bool, device=x.device)
 
         for i, exit_logits in enumerate(exit_logits_list):
-            probs = F.softmax(exit_logits, 1)
+            probs = self._scaled_probs(exit_logits, i)
             max_conf, _ = probs.max(1)
             condition = (max_conf >= tau) & (~decided)
             if tau_entropy is not None:
@@ -543,7 +568,7 @@ class EarlyExitResNet(nn.Module):
             for exit_idx, logits, feat in self._cascade_steps(x):
                 if exit_idx == self.num_exits:
                     return logits, torch.tensor([exit_idx], device=x.device)
-                probs = F.softmax(logits, 1)
+                probs = self._scaled_probs(logits, exit_idx)
                 dnorm = (exit_idx + 1) / self.num_exits
                 feats = self._gate_features(probs, logits, dnorm)
                 gate_prob = torch.sigmoid(self.gates[exit_idx](feats))
@@ -561,7 +586,7 @@ class EarlyExitResNet(nn.Module):
 
         for i, (exit_logits, gate, dnorm) in enumerate(
                 zip(exit_logits_list, self.gates, depth_norms)):
-            probs = F.softmax(exit_logits, 1)
+            probs = self._scaled_probs(exit_logits, i)
             feats = self._gate_features(probs, exit_logits, dnorm)
             gate_prob = torch.sigmoid(gate(feats))
             should_exit = (gate_prob >= gate_threshold) & (~decided)
@@ -1244,19 +1269,32 @@ def find_budget_threshold(model: EarlyExitResNet,
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(model: EarlyExitResNet, path: str, tag: str = "model"):
+    import json
     os.makedirs(path, exist_ok=True)
     fpath = os.path.join(path, f"{tag}.pt")
     torch.save(model.state_dict(), fpath)
     print(f"[Checkpoint] Saved → {fpath}")
+    temps = getattr(model, 'exit_temperatures', None)
+    if temps is not None:
+        tpath = os.path.join(path, f"{tag}_temperatures.json")
+        with open(tpath, "w") as f:
+            json.dump(temps, f)
+        print(f"[Checkpoint] Temperatures saved → {tpath}")
 
 
 def load_checkpoint(model: EarlyExitResNet, path: str, tag: str = "model",
                     device: torch.device = torch.device("cpu")):
+    import json
     fpath = os.path.join(path, f"{tag}.pt")
     if not os.path.exists(fpath):
         raise FileNotFoundError(f"Checkpoint not found: {fpath}")
-    model.load_state_dict(torch.load(fpath, map_location=device))
+    model.load_state_dict(torch.load(fpath, map_location=device, weights_only=True))
     print(f"[Checkpoint] Loaded ← {fpath}")
+    tpath = os.path.join(path, f"{tag}_temperatures.json")
+    if os.path.exists(tpath):
+        with open(tpath) as f:
+            model.exit_temperatures = json.load(f)
+        print(f"[Checkpoint] Temperatures loaded ← {tpath} {model.exit_temperatures}")
 
 
 # ---------------------------------------------------------------------------
@@ -1444,6 +1482,8 @@ def main():
                         help="Load checkpoint from --checkpoint_dir before training.")
     parser.add_argument("--log_dir", type=str, default=None,
                         help="TensorBoard log directory.")
+    parser.add_argument("--channels_last", action="store_true",
+                        help="Use NHWC (channels_last) memory format for ~33%% throughput gain on NVIDIA GPUs.")
 
     args = parser.parse_args()
 
@@ -1453,6 +1493,11 @@ def main():
     logger = Logger(log_dir=args.log_dir)
 
     trainloader, testloader, num_classes, input_shape = get_loaders(args)
+
+    if args.channels_last and device.type == "cuda":
+        trainloader = _channels_last_loader(trainloader)
+        testloader  = _channels_last_loader(testloader)
+        print("[channels_last] DataLoaders wrapped for NHWC format.")
     cifar_stem = args.cifar_stem and args.dataset != "tinyimagenet"
     if args.dataset == "tinyimagenet":
         cifar_stem = True   # still use 3×3 stem but keep maxpool (handled inside backbone)
@@ -1464,6 +1509,9 @@ def main():
         use_exit_conv=args.exit_conv,
         cifar_stem=(args.dataset in ("cifar10", "cifar100")),
     )
+    if args.channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+        print("[channels_last] Model converted to NHWC memory format.")
 
     if args.resume and args.checkpoint_dir:
         load_checkpoint(model, args.checkpoint_dir, device=device)
@@ -1504,6 +1552,8 @@ def main():
     if args.calibrate:
         print("\n[Calibrate] Running per-exit temperature scaling...")
         calibrate_temperature(model, testloader, device)
+        if args.checkpoint_dir:
+            save_checkpoint(model, args.checkpoint_dir)
 
     # ---- MAC profiling --------------------------------------------------
     mac_profile: Optional[MACProfile] = None
