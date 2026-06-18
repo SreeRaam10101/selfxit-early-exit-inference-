@@ -1,2 +1,12 @@
 torch>=2.0.0
 torchvision>=0.15.0
+
+# Plotting (--sweep --plot_dir, --difficulty_plot)
+matplotlib>=3.5.0
+numpy>=1.20.0
+
+# Optional: Triton gate kernel (--triton_gate, CUDA only)
+# triton>=2.0.0
+
+# Optional: TensorBoard logging (--log_dir)
+# tensorboard
