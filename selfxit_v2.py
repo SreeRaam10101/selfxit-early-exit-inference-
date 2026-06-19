@@ -505,6 +505,28 @@ class EarlyExitResNet(nn.Module):
         ]
         return exit_logits, final_logits
 
+    def prune_exits(self, keep_layers: List[int]) -> None:
+        """
+        Drop all exit heads/gates except those at the given backbone layers.
+
+        keep_layers must be a subset of self.exit_layers (current candidates).
+        Order of self.exit_layers/exit_heads/gates after pruning follows the
+        order layers appear in keep_layers, sorted ascending by layer index
+        (so the cascade/forward_with_exits ordering stays depth-increasing).
+        """
+        missing = [l for l in keep_layers if l not in self.exit_layers]
+        if missing:
+            raise ValueError(f"prune_exits: layers {missing} are not "
+                              f"in current exit_layers={self.exit_layers}")
+        keep_sorted = sorted(keep_layers)
+        idx_by_layer = {l: i for i, l in enumerate(self.exit_layers)}
+        kept_indices = [idx_by_layer[l] for l in keep_sorted]
+
+        self.exit_heads = nn.ModuleList([self.exit_heads[i] for i in kept_indices])
+        self.gates       = nn.ModuleList([self.gates[i] for i in kept_indices])
+        self.exit_layers = keep_sorted
+        self.num_exits    = len(keep_sorted)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)
 
