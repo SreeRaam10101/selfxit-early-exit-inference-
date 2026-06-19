@@ -832,7 +832,10 @@ def train_joint(model: EarlyExitResNet,
                 lr: float,
                 exit_loss_weight: float,
                 logger: Logger,
-                consistency_weight: float = 0.0):
+                consistency_weight: float = 0.0,
+                learned_placement: bool = False,
+                target_num_exits: Optional[int] = None,
+                probe_frac: float = 1 / 3):
     """
     Joint end-to-end training: backbone + exit heads together.
     L = L_backbone + w * sum(L_exit_i)  using ground-truth cross-entropy.
@@ -840,34 +843,55 @@ def train_joint(model: EarlyExitResNet,
     If consistency_weight > 0, adds a symmetric-KL term between each adjacent
     pair in the chain [exit0, …, exitN-1, backbone] so earlier exits are
     nudged to agree with deeper predictions (more reliable gate confidences).
+
+    If learned_placement is True, model.exit_layers is assumed to be all 4
+    candidate backbone stages ([1,2,3,4]). At epoch
+    round(epochs * probe_frac), each candidate head's held-out accuracy is
+    scored on testloader, the top target_num_exits layers (ties favor the
+    earlier/cheaper layer) are kept via model.prune_exits, and training
+    continues with the pruned model and a freshly-built optimizer. Per-layer
+    gradient-norm is also logged each candidate-phase epoch for analysis
+    (not used in the prune decision).
     """
     if epochs == 0:
         print("[Joint] Skipping (epochs=0).")
         return
-    # Depth-weighted supervision: earlier exits are harder → more weight.
-    # Linear schedule: exit 0 → exit_loss_weight, last exit → exit_loss_weight/num_exits.
-    # Average across exits equals exit_loss_weight, so the hyperparameter meaning is preserved.
+
+    probe_epoch = round(epochs * probe_frac) if learned_placement else None
+    if learned_placement:
+        assert target_num_exits is not None and target_num_exits <= model.num_exits, (
+            f"target_num_exits={target_num_exits} must be <= candidate "
+            f"count {model.num_exits}")
+        print(f"[Placement] candidate layers={model.exit_layers}, "
+              f"target={target_num_exits}, probe at epoch {probe_epoch}/{epochs}")
+        grad_norm_sums = {l: 0.0 for l in model.exit_layers}
+        grad_norm_batches = 0
+
+    def _build_optimizer_and_scheduler(remaining_epochs: int):
+        params = list(model.backbone.parameters())
+        for head in model.exit_heads:
+            params += list(head.parameters())
+        if getattr(model, "shared_proj", None) is not None:
+            params += list(model.shared_proj.parameters())
+        opt = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=5e-4)
+        sched = torch.optim.lr_scheduler.MultiStepLR(
+            opt,
+            milestones=[int(0.5 * remaining_epochs), int(0.75 * remaining_epochs)],
+            gamma=0.1,
+        )
+        return opt, sched
+
+    def _depth_weights(n: int) -> List[float]:
+        return [exit_loss_weight * (n - i) / n for i in range(n)]
+
     n = model.num_exits
-    depth_weights = [exit_loss_weight * (n - i) / n for i in range(n)]
+    depth_weights = _depth_weights(n)
     print(f"[Joint] Training {epochs} epochs, lr={lr}, "
           f"exit_weights={[f'{w:.3f}' for w in depth_weights]}")
     model.to(device)
     unfreeze(model)
 
-    # Train backbone + all exit heads jointly
-    params = list(model.backbone.parameters())
-    for head in model.exit_heads:
-        params += list(head.parameters())
-    # Shared projection (if any) is owned by the model, not the heads — add once.
-    if getattr(model, "shared_proj", None) is not None:
-        params += list(model.shared_proj.parameters())
-
-    optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=[int(0.5 * epochs), int(0.75 * epochs)],
-        gamma=0.1,
-    )
+    optimizer, scheduler = _build_optimizer_and_scheduler(epochs)
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(epochs):
@@ -889,23 +913,63 @@ def train_joint(model: EarlyExitResNet,
 
             optimizer.zero_grad()
             loss.backward()
+
+            if learned_placement and probe_epoch is not None and epoch < probe_epoch:
+                for l, head in zip(model.exit_layers, model.exit_heads):
+                    total_norm_sq = 0.0
+                    for p in head.parameters():
+                        if p.grad is not None:
+                            total_norm_sq += p.grad.norm(2).item() ** 2
+                    grad_norm_sums[l] += total_norm_sq ** 0.5
+                grad_norm_batches += 1
+
             optimizer.step()
             total_loss += loss.item() * images.size(0)
         scheduler.step()
 
         model.eval()
         correct = total = 0
+        per_layer_correct = {l: 0 for l in model.exit_layers} if learned_placement else None
         with torch.no_grad():
             for images, targets in testloader:
                 images, targets = images.to(device), targets.to(device)
-                preds = model(images).argmax(1)
+                exit_logits_list, final_logits = model.forward_with_exits(images)
+                preds = final_logits.argmax(1)
                 correct += (preds == targets).sum().item()
                 total += targets.size(0)
+                if learned_placement:
+                    for l, logits in zip(model.exit_layers, exit_logits_list):
+                        per_layer_correct[l] += (logits.argmax(1) == targets).sum().item()
         acc = correct / total * 100
         avg_loss = total_loss / len(trainloader.dataset)
         print(f"  [Joint][{epoch+1}/{epochs}] loss={avg_loss:.4f} backbone_acc={acc:.2f}%")
         logger.scalar("joint/loss", avg_loss, epoch)
         logger.scalar("joint/acc",  acc,      epoch)
+
+        if learned_placement and epoch + 1 == probe_epoch:
+            avg_grad_norms = {l: grad_norm_sums[l] / max(grad_norm_batches, 1)
+                               for l in model.exit_layers}
+            per_layer_acc = {l: per_layer_correct[l] / total * 100 for l in model.exit_layers}
+            ranked = sorted(model.exit_layers,
+                             key=lambda l: (-per_layer_acc[l], l))
+            keep = sorted(ranked[:target_num_exits])
+            drop = sorted(set(model.exit_layers) - set(keep))
+
+            print("[Placement] probe results:")
+            for l in model.exit_layers:
+                tag = "KEEP" if l in keep else "drop"
+                print(f"    layer {l}: acc={per_layer_acc[l]:.2f}%  "
+                      f"grad_norm={avg_grad_norms[l]:.4f}  [{tag}]")
+            print(f"[Placement] selected exits: {keep} (dropped: {drop})")
+
+            model.prune_exits(keep)
+            n = model.num_exits
+            depth_weights = _depth_weights(n)
+            remaining = epochs - (epoch + 1)
+            optimizer, scheduler = _build_optimizer_and_scheduler(remaining)
+            # scheduler's own epoch counter restarts at 0, scaled to `remaining`
+            # epochs rather than the original `epochs` — milestones above are
+            # computed from `remaining`, so this is intentional, not a bug.
 
 
 def train_exit_heads_distillation(model: EarlyExitResNet,
