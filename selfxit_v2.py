@@ -1533,6 +1533,14 @@ def main():
     parser.add_argument("--model", default="resnet18", choices=["resnet18", "resnet50"])
     parser.add_argument("--exits", type=int, nargs="+", default=[2, 3, 4],
                         help="Backbone layers to attach exit heads to (1–4).")
+    parser.add_argument("--learned_placement", action="store_true",
+                        help="Train candidate exit heads at all 4 backbone "
+                             "stages, probe held-out accuracy partway "
+                             "through joint training, and prune down to "
+                             "len(--exits) exits (plan.md #2). train_joint only.")
+    parser.add_argument("--placement_probe_frac", type=float, default=1/3,
+                        help="Fraction of --epochs_joint after which the "
+                             "placement probe+prune fires (default 1/3).")
     parser.add_argument("--exit_conv", action="store_true",
                         help="Add a 3×3 conv block to each exit head.")
     parser.add_argument("--exit_attention", action="store_true",
@@ -1642,16 +1650,21 @@ def main():
     if args.dataset == "tinyimagenet":
         cifar_stem = True   # still use 3×3 stem but keep maxpool (handled inside backbone)
 
+    initial_exit_layers = [1, 2, 3, 4] if args.learned_placement else args.exits
     model = EarlyExitResNet(
         model_name=args.model,
         num_classes=num_classes,
-        exit_layers=args.exits,
+        exit_layers=initial_exit_layers,
         use_exit_conv=args.exit_conv,
         cifar_stem=(args.dataset in ("cifar10", "cifar100")),
         use_attention=args.exit_attention,
         shared_projection=args.shared_projection,
         shared_embed_dim=args.shared_embed_dim,
     )
+    if args.learned_placement:
+        print(f"[Placement] learned_placement on — training all 4 candidate "
+              f"exits, will prune to {len(args.exits)} at "
+              f"{args.placement_probe_frac:.2%} of epochs_joint.")
     if args.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
         print("[channels_last] Model converted to NHWC memory format.")
