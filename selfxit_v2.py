@@ -323,15 +323,53 @@ def get_loaders(args) -> Tuple[DataLoader, DataLoader, int, Tuple[int, ...]]:
 #  Model components
 # ---------------------------------------------------------------------------
 
+class SpatialAttentionPool(nn.Module):
+    """
+    Learned spatial pooling — drop-in replacement for AdaptiveAvgPool2d((1,1)).
+
+    A 1×1 conv scores every spatial location, softmax over the H·W positions
+    turns the scores into attention weights that sum to 1, and the feature map
+    is collapsed by a weighted sum instead of a flat average. This preserves
+    the discriminative regions that plain average pooling washes out — most
+    useful at early exits where the feature map is still large.
+
+    Returns [B, C, 1, 1] so the downstream flatten/fc path is unchanged.
+    """
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.attn = nn.Conv2d(in_channels, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        scores  = self.attn(x).view(B, 1, H * W)     # [B, 1, HW]
+        weights = F.softmax(scores, dim=-1)          # [B, 1, HW] — sums to 1 over space
+        flat    = x.view(B, C, H * W)                # [B, C, HW]
+        pooled  = (flat * weights).sum(dim=-1)       # [B, C]
+        return pooled.view(B, C, 1, 1)
+
+
 class ExitHead(nn.Module):
     """
     Classifier attached to an intermediate ResNet feature map.
 
     If use_conv=True adds a 3×3 conv block before pooling to let the head
     learn richer spatial features rather than only relying on global avg-pool.
+
+    If use_attention=True the global average pool is replaced by a learned
+    SpatialAttentionPool.
+
+    If shared_proj is not None the head uses a three-stage classifier:
+        adapter (in_channels → embed_dim)  [per-exit]
+          → shared_proj (embed_dim → embed_dim)  [ONE module across all exits]
+          → classifier (embed_dim → num_classes)  [per-exit]
+    The shared module is owned by EarlyExitResNet and held here via a
+    list-wrapped attribute so it is not re-registered per head.
     """
     def __init__(self, in_channels: int, num_classes: int,
-                 hidden_dim: int = 512, use_conv: bool = False):
+                 hidden_dim: int = 512, use_conv: bool = False,
+                 use_attention: bool = False,
+                 shared_proj: Optional[nn.Module] = None,
+                 embed_dim: int = 128):
         super().__init__()
         self.use_conv = use_conv
         if use_conv:
@@ -340,15 +378,27 @@ class ExitHead(nn.Module):
                 nn.BatchNorm2d(in_channels),
                 nn.ReLU(inplace=True),
             )
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc1  = nn.Linear(in_channels, hidden_dim)
+        self.pool = (SpatialAttentionPool(in_channels) if use_attention
+                     else nn.AdaptiveAvgPool2d((1, 1)))
+
+        self.shared = shared_proj is not None
         self.drop = nn.Dropout(0.1)
-        self.fc2  = nn.Linear(hidden_dim, num_classes)
+        if self.shared:
+            self.adapter    = nn.Linear(in_channels, embed_dim)
+            self._shared    = [shared_proj]   # list-wrapped: not registered as a submodule
+            self.classifier = nn.Linear(embed_dim, num_classes)
+        else:
+            self.fc1 = nn.Linear(in_channels, hidden_dim)
+            self.fc2 = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_conv:
             x = self.conv(x)
         x = self.pool(x).flatten(1)
+        if self.shared:
+            x = F.relu(self.adapter(x))
+            x = F.relu(self._shared[0](x))
+            return self.classifier(self.drop(x))
         return self.fc2(self.drop(F.relu(self.fc1(x))))
 
 
@@ -390,7 +440,10 @@ class EarlyExitResNet(nn.Module):
     def __init__(self, model_name: str, num_classes: int,
                  exit_layers: List[int] = (2, 3, 4),
                  use_exit_conv: bool = False,
-                 cifar_stem: bool = True):
+                 cifar_stem: bool = True,
+                 use_attention: bool = False,
+                 shared_projection: bool = False,
+                 shared_embed_dim: int = 128):
         super().__init__()
         assert model_name in ("resnet18", "resnet50")
         self.exit_layers = list(exit_layers)
@@ -409,8 +462,15 @@ class EarlyExitResNet(nn.Module):
         backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)
         self.backbone = backbone
 
+        # One projection shared across all exit heads (owned here so it appears
+        # exactly once in state_dict / parameters); None keeps the v1 layout.
+        self.shared_proj = (nn.Linear(shared_embed_dim, shared_embed_dim)
+                            if shared_projection else None)
+
         self.exit_heads = nn.ModuleList([
-            ExitHead(feat_dims[l], num_classes, use_conv=use_exit_conv)
+            ExitHead(feat_dims[l], num_classes, use_conv=use_exit_conv,
+                     use_attention=use_attention,
+                     shared_proj=self.shared_proj, embed_dim=shared_embed_dim)
             for l in exit_layers
         ])
         self.gates = nn.ModuleList([GateMLP() for _ in exit_layers])
@@ -728,6 +788,20 @@ def train_backbone(model: EarlyExitResNet,
         logger.scalar("backbone/acc",  acc,      epoch)
 
 
+def _symmetric_kl(logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch.Tensor:
+    """Mean symmetric KL = 0.5*(KL(p‖q)+KL(q‖p)) between two logit tensors.
+
+    Gradients flow to both arguments on purpose — the term pulls the two
+    predictions toward each other rather than distilling one into the other.
+    """
+    log_p = F.log_softmax(logits_p, dim=1)
+    log_q = F.log_softmax(logits_q, dim=1)
+    p, q = log_p.exp(), log_q.exp()
+    kl_pq = (p * (log_p - log_q)).sum(1).mean()
+    kl_qp = (q * (log_q - log_p)).sum(1).mean()
+    return 0.5 * (kl_pq + kl_qp)
+
+
 def train_joint(model: EarlyExitResNet,
                 trainloader: DataLoader,
                 testloader: DataLoader,
@@ -735,10 +809,15 @@ def train_joint(model: EarlyExitResNet,
                 epochs: int,
                 lr: float,
                 exit_loss_weight: float,
-                logger: Logger):
+                logger: Logger,
+                consistency_weight: float = 0.0):
     """
     Joint end-to-end training: backbone + exit heads together.
     L = L_backbone + w * sum(L_exit_i)  using ground-truth cross-entropy.
+
+    If consistency_weight > 0, adds a symmetric-KL term between each adjacent
+    pair in the chain [exit0, …, exitN-1, backbone] so earlier exits are
+    nudged to agree with deeper predictions (more reliable gate confidences).
     """
     if epochs == 0:
         print("[Joint] Skipping (epochs=0).")
@@ -757,6 +836,9 @@ def train_joint(model: EarlyExitResNet,
     params = list(model.backbone.parameters())
     for head in model.exit_heads:
         params += list(head.parameters())
+    # Shared projection (if any) is owned by the model, not the heads — add once.
+    if getattr(model, "shared_proj", None) is not None:
+        params += list(model.shared_proj.parameters())
 
     optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -776,6 +858,12 @@ def train_joint(model: EarlyExitResNet,
             loss = criterion(final_logits, targets)
             for i, exit_logits in enumerate(exit_logits_list):
                 loss = loss + depth_weights[i] * criterion(exit_logits, targets)
+
+            if consistency_weight > 0.0:
+                chain = exit_logits_list + [final_logits]
+                cons = sum(_symmetric_kl(a, b)
+                           for a, b in zip(chain[:-1], chain[1:]))
+                loss = loss + consistency_weight * cons
 
             optimizer.zero_grad()
             loss.backward()
@@ -1425,6 +1513,12 @@ def main():
                         help="Backbone layers to attach exit heads to (1–4).")
     parser.add_argument("--exit_conv", action="store_true",
                         help="Add a 3×3 conv block to each exit head.")
+    parser.add_argument("--exit_attention", action="store_true",
+                        help="Replace avg-pool in exit heads with learned spatial attention pooling.")
+    parser.add_argument("--shared_projection", action="store_true",
+                        help="Route exit heads through one shared projection layer (adapter→shared→classifier).")
+    parser.add_argument("--shared_embed_dim", type=int, default=128,
+                        help="Embedding width for --shared_projection.")
     parser.add_argument("--cifar_stem", action="store_true", default=True,
                         help="Use 3×3 conv stem (for CIFAR/TinyImageNet).")
     parser.add_argument("--no_cifar_stem", dest="cifar_stem", action="store_false")
@@ -1438,6 +1532,8 @@ def main():
                         help="Epochs for joint training.")
     parser.add_argument("--exit_loss_weight", type=float, default=0.5,
                         help="Weight for exit losses in joint training.")
+    parser.add_argument("--consistency_weight", type=float, default=0.0,
+                        help="Weight for symmetric-KL consistency between adjacent exits (joint training).")
     parser.add_argument("--epochs_exits", type=int, default=20,
                         help="Epochs for distillation training of exit heads (sequential mode).")
     parser.add_argument("--epochs_gates", type=int, default=5)
@@ -1530,6 +1626,9 @@ def main():
         exit_layers=args.exits,
         use_exit_conv=args.exit_conv,
         cifar_stem=(args.dataset in ("cifar10", "cifar100")),
+        use_attention=args.exit_attention,
+        shared_projection=args.shared_projection,
+        shared_embed_dim=args.shared_embed_dim,
     )
     if args.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
@@ -1545,7 +1644,8 @@ def main():
                         epochs=args.epochs_joint,
                         lr=args.lr_joint,
                         exit_loss_weight=args.exit_loss_weight,
-                        logger=logger)
+                        logger=logger,
+                        consistency_weight=args.consistency_weight)
         else:
             train_backbone(model, trainloader, testloader, device,
                            epochs=args.epochs_backbone,
