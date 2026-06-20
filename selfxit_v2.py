@@ -1744,7 +1744,10 @@ def main():
                         lr=args.lr_joint,
                         exit_loss_weight=args.exit_loss_weight,
                         logger=logger,
-                        consistency_weight=args.consistency_weight)
+                        consistency_weight=args.consistency_weight,
+                        learned_placement=args.learned_placement,
+                        target_num_exits=len(args.exits),
+                        probe_frac=args.placement_probe_frac)
         else:
             train_backbone(model, trainloader, testloader, device,
                            epochs=args.epochs_backbone,
