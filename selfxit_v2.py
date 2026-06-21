@@ -185,6 +185,7 @@ def profile_model_macs(model: "EarlyExitResNet",
                        input_shape: Tuple[int, ...],
                        device: torch.device) -> MACProfile:
     """Profile MACs per backbone segment and per exit head."""
+    model.to(device)
     model.eval()
     bb = model.backbone
     x0 = torch.zeros(1, *input_shape, device=device)
