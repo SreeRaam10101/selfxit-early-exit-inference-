@@ -102,6 +102,18 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _sync(device: torch.device) -> None:
+    """Block until all queued work on this device has completed.
+
+    CUDA/MPS kernels are launched asynchronously — timing code without this
+    measures enqueue time, not compute time.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
 def entropy_from_probs(probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Shannon entropy H = -sum(p log p)."""
     return -(probs * (probs + eps).log()).sum(dim=1)
@@ -1101,6 +1113,7 @@ def evaluate_policy(model: EarlyExitResNet,
     with torch.no_grad():
         for images, targets in testloader:
             images, targets = images.to(device), targets.to(device)
+            _sync(device)
             t0 = time.time()
             if policy == "static":
                 logits, exit_ids = model.inference_static(
@@ -1108,6 +1121,7 @@ def evaluate_policy(model: EarlyExitResNet,
             else:
                 logits, exit_ids = model.inference_dynamic(
                     images, gate_threshold=gate_threshold)
+            _sync(device)
             total_time += time.time() - t0
 
             preds = logits.argmax(1)
@@ -1482,17 +1496,17 @@ def benchmark_single_sample(model: EarlyExitResNet,
         for _ in range(n_runs):
             img = random.choice(all_images).unsqueeze(0).to(device)
 
+            _sync(device)
             t0 = time.perf_counter()
             logits_full, eid_full = run_inference(img, cascade=False)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            _sync(device)
             results[False]["latencies"].append((time.perf_counter() - t0) * 1000)
             results[False]["exits"].append(eid_full[0].item())
 
+            _sync(device)
             t0 = time.perf_counter()
             logits_cascade, eid_cascade = run_inference(img, cascade=True)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            _sync(device)
             results[True]["latencies"].append((time.perf_counter() - t0) * 1000)
             results[True]["exits"].append(eid_cascade[0].item())
 
