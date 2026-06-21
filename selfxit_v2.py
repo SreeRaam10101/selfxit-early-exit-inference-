@@ -37,7 +37,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 import torchvision
 import torchvision.transforms as T
@@ -217,10 +217,34 @@ def profile_model_macs(model: "EarlyExitResNet",
 #  Datasets
 # ---------------------------------------------------------------------------
 
+def _split_train_val(full_train_aug: torch.utils.data.Dataset,
+                     full_train_noaug: torch.utils.data.Dataset,
+                     val_frac: float,
+                     seed: int = 42) -> Tuple[Subset, Subset]:
+    """
+    Split a training dataset into (train, val) by a fixed-seed random
+    permutation of indices.
+
+    full_train_aug and full_train_noaug must be two Dataset instances built
+    over identical underlying data in identical order (e.g. the same
+    CIFAR10(train=True, ...) call with only the transform differing), so
+    index i refers to the same sample in both. The train subset is drawn
+    from full_train_aug (train-time augmentation); the val subset is drawn
+    from full_train_noaug (test-time transform) so calibration/threshold
+    tuning never sees randomly cropped/flipped pixels.
+    """
+    n_total = len(full_train_aug)
+    n_val = int(n_total * val_frac)
+    gen = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n_total, generator=gen).tolist()
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    return Subset(full_train_aug, train_idx), Subset(full_train_noaug, val_idx)
+
+
 def _cifar_loaders(dataset: str, batch_size: int,
-                   num_workers: int) -> Tuple[DataLoader, DataLoader]:
+                   num_workers: int, val_frac: float
+                   ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     assert dataset in ("cifar10", "cifar100")
-    num_classes = 10 if dataset == "cifar10" else 100
     mean = (0.4914, 0.4822, 0.4465)
     std  = (0.2470, 0.2435, 0.2616)
 
@@ -234,12 +258,16 @@ def _cifar_loaders(dataset: str, batch_size: int,
 
     cls = torchvision.datasets.CIFAR10 if dataset == "cifar10" \
         else torchvision.datasets.CIFAR100
-    trainset = cls(root="./data", train=True,  download=True, transform=train_tf)
-    testset  = cls(root="./data", train=False, download=True, transform=test_tf)
+    full_train_aug   = cls(root="./data", train=True,  download=True, transform=train_tf)
+    full_train_noaug = cls(root="./data", train=True,  download=True, transform=test_tf)
+    testset           = cls(root="./data", train=False, download=True, transform=test_tf)
+
+    trainset, valset = _split_train_val(full_train_aug, full_train_noaug, val_frac)
 
     pin = torch.cuda.is_available()
     kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin)
     return (DataLoader(trainset, shuffle=True,  **kwargs),
+            DataLoader(valset,   shuffle=False, **kwargs),
             DataLoader(testset,  shuffle=False, **kwargs))
 
 
@@ -272,7 +300,8 @@ def _setup_tinyimagenet_val(data_root: str) -> str:
 
 
 def _tinyimagenet_loaders(data_root: str, batch_size: int,
-                          num_workers: int) -> Tuple[DataLoader, DataLoader]:
+                          num_workers: int, val_frac: float
+                          ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     mean = (0.4802, 0.4481, 0.3975)
     std  = (0.2770, 0.2691, 0.2821)
 
@@ -287,12 +316,16 @@ def _tinyimagenet_loaders(data_root: str, batch_size: int,
     train_dir = os.path.join(data_root, "train")
     val_dir = _setup_tinyimagenet_val(data_root)
 
-    trainset = torchvision.datasets.ImageFolder(train_dir, transform=train_tf)
-    testset  = torchvision.datasets.ImageFolder(val_dir,   transform=test_tf)
+    full_train_aug   = torchvision.datasets.ImageFolder(train_dir, transform=train_tf)
+    full_train_noaug = torchvision.datasets.ImageFolder(train_dir, transform=test_tf)
+    testset           = torchvision.datasets.ImageFolder(val_dir,   transform=test_tf)
+
+    trainset, valset = _split_train_val(full_train_aug, full_train_noaug, val_frac)
 
     pin = torch.cuda.is_available()
     kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin)
     return (DataLoader(trainset, shuffle=True,  **kwargs),
+            DataLoader(valset,   shuffle=False, **kwargs),
             DataLoader(testset,  shuffle=False, **kwargs))
 
 
@@ -308,15 +341,17 @@ def _channels_last_loader(loader: DataLoader) -> DataLoader:
     return _CLLoader(loader)
 
 
-def get_loaders(args) -> Tuple[DataLoader, DataLoader, int, Tuple[int, ...]]:
-    """Returns (trainloader, testloader, num_classes, input_shape)."""
+def get_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int, Tuple[int, ...]]:
+    """Returns (trainloader, valloader, testloader, num_classes, input_shape)."""
     if args.dataset in ("cifar10", "cifar100"):
         num_classes = 10 if args.dataset == "cifar10" else 100
-        train, test = _cifar_loaders(args.dataset, args.batch_size, args.num_workers)
-        return train, test, num_classes, (3, 32, 32)
+        train, val, test = _cifar_loaders(args.dataset, args.batch_size,
+                                          args.num_workers, args.val_frac)
+        return train, val, test, num_classes, (3, 32, 32)
     else:
-        train, test = _tinyimagenet_loaders(args.data_root, args.batch_size, args.num_workers)
-        return train, test, 200, (3, 64, 64)
+        train, val, test = _tinyimagenet_loaders(args.data_root, args.batch_size,
+                                                  args.num_workers, args.val_frac)
+        return train, val, test, 200, (3, 64, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -1506,6 +1541,10 @@ def main():
                         help="Root dir for TinyImageNet.")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--val_frac", type=float, default=0.1,
+                        help="Fraction of the training set held out as a "
+                             "validation split for calibration/placement-probe/"
+                             "budget-search/sweep tuning (never the test set).")
 
     # Model
     parser.add_argument("--model", default="resnet18", choices=["resnet18", "resnet50"])
