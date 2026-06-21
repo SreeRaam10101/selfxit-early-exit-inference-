@@ -991,7 +991,7 @@ def collect_gate_data(model: EarlyExitResNet,
 
             for i, (exit_logits, dnorm) in enumerate(
                     zip(exit_logits_list, depth_norms)):
-                probs = F.softmax(exit_logits, 1)
+                probs = model._scaled_probs(exit_logits, i)
                 max_conf, _ = probs.max(1)
                 labels = ((exit_logits.argmax(1) == final_preds) &
                           (max_conf >= gate_label_conf)).float()
