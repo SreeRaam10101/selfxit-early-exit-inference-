@@ -1639,10 +1639,11 @@ def main():
 
     logger = Logger(log_dir=args.log_dir)
 
-    trainloader, testloader, num_classes, input_shape = get_loaders(args)
+    trainloader, valloader, testloader, num_classes, input_shape = get_loaders(args)
 
     if args.channels_last and device.type == "cuda":
         trainloader = _channels_last_loader(trainloader)
+        valloader   = _channels_last_loader(valloader)
         testloader  = _channels_last_loader(testloader)
         print("[channels_last] DataLoaders wrapped for NHWC format.")
 
@@ -1697,6 +1698,14 @@ def main():
                                           T_end=args.T_end,
                                           logger=logger)
 
+        # Calibrate before gate training (not after) so collect_gate_data's
+        # gate features are computed from the same scaled probs the gate
+        # will see at inference (A2). No-op when --calibrate is off, since
+        # _get_temperature() defaults to T=1.0 either way.
+        if args.calibrate:
+            print("\n[Calibrate] Running per-exit temperature scaling...")
+            calibrate_temperature(model, valloader, device)
+
         gate_data = collect_gate_data(model, trainloader, device,
                                       max_batches=args.gate_max_batches,
                                       gate_label_conf=args.gate_label_conf)
@@ -1708,11 +1717,12 @@ def main():
 
         if args.checkpoint_dir:
             save_checkpoint(model, args.checkpoint_dir)
-
-    # ---- Temperature scaling calibration --------------------------------
-    if args.calibrate:
+    elif args.calibrate:
+        # eval_only + calibrate: calibrate the loaded checkpoint's heads
+        # without retraining anything (gates are untouched in this branch,
+        # same as before this change).
         print("\n[Calibrate] Running per-exit temperature scaling...")
-        calibrate_temperature(model, testloader, device)
+        calibrate_temperature(model, valloader, device)
         if args.checkpoint_dir:
             save_checkpoint(model, args.checkpoint_dir)
 
@@ -1732,7 +1742,7 @@ def main():
     gate_threshold = args.gate_threshold
     if args.compute_budget is not None and mac_profile is not None:
         gate_threshold = find_budget_threshold(
-            model, testloader, device,
+            model, valloader, device,
             target_budget=args.compute_budget,
             mac_profile=mac_profile,
         )
@@ -1742,10 +1752,10 @@ def main():
     dynamic_pts: List[Dict] = []
     if args.sweep:
         if args.policy in ("static", "both"):
-            static_pts = pareto_sweep(model, testloader, device, "static",
+            static_pts = pareto_sweep(model, valloader, device, "static",
                                       mac_profile=mac_profile)
         if args.policy in ("dynamic", "both"):
-            dynamic_pts = pareto_sweep(model, testloader, device, "dynamic",
+            dynamic_pts = pareto_sweep(model, valloader, device, "dynamic",
                                        mac_profile=mac_profile)
         if args.plot_dir:
             plot_pareto_curves(static_pts, dynamic_pts,
