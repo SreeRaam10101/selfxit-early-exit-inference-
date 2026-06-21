@@ -1680,7 +1680,7 @@ def main():
     # ---- Training -------------------------------------------------------
     if not args.eval_only:
         if args.joint_training:
-            train_joint(model, trainloader, testloader, device,
+            train_joint(model, trainloader, valloader, device,
                         epochs=args.epochs_joint,
                         lr=args.lr_joint,
                         exit_loss_weight=args.exit_loss_weight,
