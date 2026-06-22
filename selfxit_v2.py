@@ -952,8 +952,9 @@ def train_exit_heads_distillation(model: EarlyExitResNet,
     # requires_grad=False (freeze) does not stop BatchNorm running-stat
     # updates — those are buffers, not parameters, and update on any
     # train-mode forward regardless of grad. Keep the backbone in eval mode
-    # so its BN stats don't drift while "frozen"; only the exit heads (no
-    # BN) need train-mode behavior (dropout) here.
+    # so its BN stats don't drift while "frozen"; exit heads need
+    # train-mode behavior (dropout, and BatchNorm if --exit_conv is set —
+    # that BN is intentionally still trained here, it belongs to the head).
     model.eval()
     for head in model.exit_heads:
         head.train()
