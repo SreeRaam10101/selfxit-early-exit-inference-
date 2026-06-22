@@ -949,7 +949,14 @@ def train_exit_heads_distillation(model: EarlyExitResNet,
     print(f"[Exits] Training {epochs} epochs, lr={lr}, T: {T_start}→{T_end}")
     model.to(device)
     freeze(model)
-    model.train()
+    # requires_grad=False (freeze) does not stop BatchNorm running-stat
+    # updates — those are buffers, not parameters, and update on any
+    # train-mode forward regardless of grad. Keep the backbone in eval mode
+    # so its BN stats don't drift while "frozen"; only the exit heads (no
+    # BN) need train-mode behavior (dropout) here.
+    model.eval()
+    for head in model.exit_heads:
+        head.train()
 
     params = [p for head in model.exit_heads for p in head.parameters()]
     optimizer = torch.optim.Adam(params, lr=lr)
@@ -961,9 +968,11 @@ def train_exit_heads_distillation(model: EarlyExitResNet,
         total_loss = 0.0
         for images, _ in trainloader:
             images = images.to(device)
-            with torch.no_grad():
-                teacher_probs = F.softmax(model(images) / T, 1)
-            exit_logits_list, _ = model.forward_with_exits(images)
+            # Single backbone forward serves both the teacher signal
+            # (final_logits) and the exit-head inputs — the backbone is
+            # frozen and in eval mode, so running it twice was pure waste.
+            exit_logits_list, final_logits = model.forward_with_exits(images)
+            teacher_probs = F.softmax(final_logits.detach() / T, 1)
             loss = sum(
                 kldiv(F.log_softmax(el / T, 1), teacher_probs)
                 for el in exit_logits_list
