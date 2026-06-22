@@ -1428,7 +1428,16 @@ def find_budget_threshold(model: EarlyExitResNet,
             lo = mid   # too few FLOPs → raise threshold
 
     best = (lo + hi) / 2
-    print(f"[Budget] Found gate_threshold={best:.4f} → avg {avg_flops(best)*100:.1f}% FLOPs")
+    achieved = avg_flops(best)
+    print(f"[Budget] Found gate_threshold={best:.4f} → avg {achieved*100:.1f}% FLOPs")
+
+    tol = 0.02
+    if abs(achieved - target_budget) > tol:
+        print(f"[Budget] WARNING: achieved FLOPs ({achieved*100:.1f}%) is "
+              f"more than {tol*100:.0f} points from target "
+              f"({target_budget*100:.1f}%) — achievable FLOPs levels are a "
+              f"discrete step function (exit counts are integers) and may "
+              f"not include your exact target.")
     return best
 
 
