@@ -288,26 +288,36 @@ def _setup_tinyimagenet_val(data_root: str) -> str:
     """
     Reorganise TinyImageNet val/images/ into ImageFolder format.
     Creates <data_root>/val_organized/<class>/<img> if not already present.
+
+    Verifies the existing directory's file count against the annotations
+    file before trusting it — a prior run interrupted mid-copy would
+    otherwise leave a partial val_organized/ that looks "done" (the
+    directory exists) but is missing files, with no error anywhere.
     """
     organized = os.path.join(data_root, "val_organized")
-    if os.path.isdir(organized):
-        return organized
-
     ann_path = os.path.join(data_root, "val", "val_annotations.txt")
     if not os.path.exists(ann_path):
         raise FileNotFoundError(
             f"TinyImageNet val annotations not found: {ann_path}\n"
             "Download TinyImageNet and point --data_root to the extracted folder."
         )
-    os.makedirs(organized, exist_ok=True)
     with open(ann_path) as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            img_name, class_id = parts[0], parts[1]
-            src = os.path.join(data_root, "val", "images", img_name)
-            dst_dir = os.path.join(organized, class_id)
-            os.makedirs(dst_dir, exist_ok=True)
-            shutil.copy2(src, os.path.join(dst_dir, img_name))
+        annotations = [line.strip().split("\t") for line in f]
+
+    if os.path.isdir(organized):
+        existing_count = sum(len(files) for _, _, files in os.walk(organized))
+        if existing_count == len(annotations):
+            return organized
+        print(f"[Dataset] {organized} exists but has {existing_count} files, "
+              f"expected {len(annotations)} — rebuilding.")
+        shutil.rmtree(organized)
+
+    os.makedirs(organized, exist_ok=True)
+    for img_name, class_id, *_rest in annotations:
+        src = os.path.join(data_root, "val", "images", img_name)
+        dst_dir = os.path.join(organized, class_id)
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copy2(src, os.path.join(dst_dir, img_name))
     print(f"[Dataset] TinyImageNet val organised → {organized}")
     return organized
 
