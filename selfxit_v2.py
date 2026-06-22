@@ -37,7 +37,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 import torchvision
 import torchvision.transforms as T
@@ -100,6 +100,18 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def _sync(device: torch.device) -> None:
+    """Block until all queued work on this device has completed.
+
+    CUDA/MPS kernels are launched asynchronously — timing code without this
+    measures enqueue time, not compute time.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def entropy_from_probs(probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -185,6 +197,7 @@ def profile_model_macs(model: "EarlyExitResNet",
                        input_shape: Tuple[int, ...],
                        device: torch.device) -> MACProfile:
     """Profile MACs per backbone segment and per exit head."""
+    model.to(device)
     model.eval()
     bb = model.backbone
     x0 = torch.zeros(1, *input_shape, device=device)
@@ -217,10 +230,34 @@ def profile_model_macs(model: "EarlyExitResNet",
 #  Datasets
 # ---------------------------------------------------------------------------
 
+def _split_train_val(full_train_aug: torch.utils.data.Dataset,
+                     full_train_noaug: torch.utils.data.Dataset,
+                     val_frac: float,
+                     seed: int = 42) -> Tuple[Subset, Subset]:
+    """
+    Split a training dataset into (train, val) by a fixed-seed random
+    permutation of indices.
+
+    full_train_aug and full_train_noaug must be two Dataset instances built
+    over identical underlying data in identical order (e.g. the same
+    CIFAR10(train=True, ...) call with only the transform differing), so
+    index i refers to the same sample in both. The train subset is drawn
+    from full_train_aug (train-time augmentation); the val subset is drawn
+    from full_train_noaug (test-time transform) so calibration/threshold
+    tuning never sees randomly cropped/flipped pixels.
+    """
+    n_total = len(full_train_aug)
+    n_val = int(n_total * val_frac)
+    gen = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n_total, generator=gen).tolist()
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    return Subset(full_train_aug, train_idx), Subset(full_train_noaug, val_idx)
+
+
 def _cifar_loaders(dataset: str, batch_size: int,
-                   num_workers: int) -> Tuple[DataLoader, DataLoader]:
+                   num_workers: int, val_frac: float
+                   ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     assert dataset in ("cifar10", "cifar100")
-    num_classes = 10 if dataset == "cifar10" else 100
     mean = (0.4914, 0.4822, 0.4465)
     std  = (0.2470, 0.2435, 0.2616)
 
@@ -234,12 +271,16 @@ def _cifar_loaders(dataset: str, batch_size: int,
 
     cls = torchvision.datasets.CIFAR10 if dataset == "cifar10" \
         else torchvision.datasets.CIFAR100
-    trainset = cls(root="./data", train=True,  download=True, transform=train_tf)
-    testset  = cls(root="./data", train=False, download=True, transform=test_tf)
+    full_train_aug   = cls(root="./data", train=True,  download=True, transform=train_tf)
+    full_train_noaug = cls(root="./data", train=True,  download=True, transform=test_tf)
+    testset           = cls(root="./data", train=False, download=True, transform=test_tf)
+
+    trainset, valset = _split_train_val(full_train_aug, full_train_noaug, val_frac)
 
     pin = torch.cuda.is_available()
     kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin)
     return (DataLoader(trainset, shuffle=True,  **kwargs),
+            DataLoader(valset,   shuffle=False, **kwargs),
             DataLoader(testset,  shuffle=False, **kwargs))
 
 
@@ -247,32 +288,43 @@ def _setup_tinyimagenet_val(data_root: str) -> str:
     """
     Reorganise TinyImageNet val/images/ into ImageFolder format.
     Creates <data_root>/val_organized/<class>/<img> if not already present.
+
+    Verifies the existing directory's file count against the annotations
+    file before trusting it — a prior run interrupted mid-copy would
+    otherwise leave a partial val_organized/ that looks "done" (the
+    directory exists) but is missing files, with no error anywhere.
     """
     organized = os.path.join(data_root, "val_organized")
-    if os.path.isdir(organized):
-        return organized
-
     ann_path = os.path.join(data_root, "val", "val_annotations.txt")
     if not os.path.exists(ann_path):
         raise FileNotFoundError(
             f"TinyImageNet val annotations not found: {ann_path}\n"
             "Download TinyImageNet and point --data_root to the extracted folder."
         )
-    os.makedirs(organized, exist_ok=True)
     with open(ann_path) as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            img_name, class_id = parts[0], parts[1]
-            src = os.path.join(data_root, "val", "images", img_name)
-            dst_dir = os.path.join(organized, class_id)
-            os.makedirs(dst_dir, exist_ok=True)
-            shutil.copy2(src, os.path.join(dst_dir, img_name))
+        annotations = [line.strip().split("\t") for line in f]
+
+    if os.path.isdir(organized):
+        existing_count = sum(len(files) for _, _, files in os.walk(organized))
+        if existing_count == len(annotations):
+            return organized
+        print(f"[Dataset] {organized} exists but has {existing_count} files, "
+              f"expected {len(annotations)} — rebuilding.")
+        shutil.rmtree(organized)
+
+    os.makedirs(organized, exist_ok=True)
+    for img_name, class_id, *_rest in annotations:
+        src = os.path.join(data_root, "val", "images", img_name)
+        dst_dir = os.path.join(organized, class_id)
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copy2(src, os.path.join(dst_dir, img_name))
     print(f"[Dataset] TinyImageNet val organised → {organized}")
     return organized
 
 
 def _tinyimagenet_loaders(data_root: str, batch_size: int,
-                          num_workers: int) -> Tuple[DataLoader, DataLoader]:
+                          num_workers: int, val_frac: float
+                          ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     mean = (0.4802, 0.4481, 0.3975)
     std  = (0.2770, 0.2691, 0.2821)
 
@@ -287,12 +339,16 @@ def _tinyimagenet_loaders(data_root: str, batch_size: int,
     train_dir = os.path.join(data_root, "train")
     val_dir = _setup_tinyimagenet_val(data_root)
 
-    trainset = torchvision.datasets.ImageFolder(train_dir, transform=train_tf)
-    testset  = torchvision.datasets.ImageFolder(val_dir,   transform=test_tf)
+    full_train_aug   = torchvision.datasets.ImageFolder(train_dir, transform=train_tf)
+    full_train_noaug = torchvision.datasets.ImageFolder(train_dir, transform=test_tf)
+    testset           = torchvision.datasets.ImageFolder(val_dir,   transform=test_tf)
+
+    trainset, valset = _split_train_val(full_train_aug, full_train_noaug, val_frac)
 
     pin = torch.cuda.is_available()
     kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin)
     return (DataLoader(trainset, shuffle=True,  **kwargs),
+            DataLoader(valset,   shuffle=False, **kwargs),
             DataLoader(testset,  shuffle=False, **kwargs))
 
 
@@ -308,15 +364,17 @@ def _channels_last_loader(loader: DataLoader) -> DataLoader:
     return _CLLoader(loader)
 
 
-def get_loaders(args) -> Tuple[DataLoader, DataLoader, int, Tuple[int, ...]]:
-    """Returns (trainloader, testloader, num_classes, input_shape)."""
+def get_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int, Tuple[int, ...]]:
+    """Returns (trainloader, valloader, testloader, num_classes, input_shape)."""
     if args.dataset in ("cifar10", "cifar100"):
         num_classes = 10 if args.dataset == "cifar10" else 100
-        train, test = _cifar_loaders(args.dataset, args.batch_size, args.num_workers)
-        return train, test, num_classes, (3, 32, 32)
+        train, val, test = _cifar_loaders(args.dataset, args.batch_size,
+                                          args.num_workers, args.val_frac)
+        return train, val, test, num_classes, (3, 32, 32)
     else:
-        train, test = _tinyimagenet_loaders(args.data_root, args.batch_size, args.num_workers)
-        return train, test, 200, (3, 64, 64)
+        train, val, test = _tinyimagenet_loaders(args.data_root, args.batch_size,
+                                                  args.num_workers, args.val_frac)
+        return train, val, test, 200, (3, 64, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -987,7 +1045,15 @@ def train_exit_heads_distillation(model: EarlyExitResNet,
     print(f"[Exits] Training {epochs} epochs, lr={lr}, T: {T_start}→{T_end}")
     model.to(device)
     freeze(model)
-    model.train()
+    # requires_grad=False (freeze) does not stop BatchNorm running-stat
+    # updates — those are buffers, not parameters, and update on any
+    # train-mode forward regardless of grad. Keep the backbone in eval mode
+    # so its BN stats don't drift while "frozen"; exit heads need
+    # train-mode behavior (dropout, and BatchNorm if --exit_conv is set —
+    # that BN is intentionally still trained here, it belongs to the head).
+    model.eval()
+    for head in model.exit_heads:
+        head.train()
 
     params = [p for head in model.exit_heads for p in head.parameters()]
     optimizer = torch.optim.Adam(params, lr=lr)
@@ -999,9 +1065,11 @@ def train_exit_heads_distillation(model: EarlyExitResNet,
         total_loss = 0.0
         for images, _ in trainloader:
             images = images.to(device)
-            with torch.no_grad():
-                teacher_probs = F.softmax(model(images) / T, 1)
-            exit_logits_list, _ = model.forward_with_exits(images)
+            # Single backbone forward serves both the teacher signal
+            # (final_logits) and the exit-head inputs — the backbone is
+            # frozen and in eval mode, so running it twice was pure waste.
+            exit_logits_list, final_logits = model.forward_with_exits(images)
+            teacher_probs = F.softmax(final_logits.detach() / T, 1)
             loss = sum(
                 kldiv(F.log_softmax(el / T, 1), teacher_probs)
                 for el in exit_logits_list
@@ -1042,7 +1110,7 @@ def collect_gate_data(model: EarlyExitResNet,
 
             for i, (exit_logits, dnorm) in enumerate(
                     zip(exit_logits_list, depth_norms)):
-                probs = F.softmax(exit_logits, 1)
+                probs = model._scaled_probs(exit_logits, i)
                 max_conf, _ = probs.max(1)
                 labels = ((exit_logits.argmax(1) == final_preds) &
                           (max_conf >= gate_label_conf)).float()
@@ -1151,6 +1219,7 @@ def evaluate_policy(model: EarlyExitResNet,
     with torch.no_grad():
         for images, targets in testloader:
             images, targets = images.to(device), targets.to(device)
+            _sync(device)
             t0 = time.time()
             if policy == "static":
                 logits, exit_ids = model.inference_static(
@@ -1158,6 +1227,7 @@ def evaluate_policy(model: EarlyExitResNet,
             else:
                 logits, exit_ids = model.inference_dynamic(
                     images, gate_threshold=gate_threshold)
+            _sync(device)
             total_time += time.time() - t0
 
             preds = logits.argmax(1)
@@ -1444,7 +1514,16 @@ def find_budget_threshold(model: EarlyExitResNet,
             lo = mid   # too few FLOPs → raise threshold
 
     best = (lo + hi) / 2
-    print(f"[Budget] Found gate_threshold={best:.4f} → avg {avg_flops(best)*100:.1f}% FLOPs")
+    achieved = avg_flops(best)
+    print(f"[Budget] Found gate_threshold={best:.4f} → avg {achieved*100:.1f}% FLOPs")
+
+    tol = 0.02
+    if abs(achieved - target_budget) > tol:
+        print(f"[Budget] WARNING: achieved FLOPs ({achieved*100:.1f}%) is "
+              f"more than {tol*100:.0f} points from target "
+              f"({target_budget*100:.1f}%) — achievable FLOPs levels are a "
+              f"discrete step function (exit counts are integers) and may "
+              f"not include your exact target.")
     return best
 
 
@@ -1532,17 +1611,17 @@ def benchmark_single_sample(model: EarlyExitResNet,
         for _ in range(n_runs):
             img = random.choice(all_images).unsqueeze(0).to(device)
 
+            _sync(device)
             t0 = time.perf_counter()
             logits_full, eid_full = run_inference(img, cascade=False)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            _sync(device)
             results[False]["latencies"].append((time.perf_counter() - t0) * 1000)
             results[False]["exits"].append(eid_full[0].item())
 
+            _sync(device)
             t0 = time.perf_counter()
             logits_cascade, eid_cascade = run_inference(img, cascade=True)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            _sync(device)
             results[True]["latencies"].append((time.perf_counter() - t0) * 1000)
             results[True]["exits"].append(eid_cascade[0].item())
 
@@ -1592,6 +1671,10 @@ def main():
                         help="Root dir for TinyImageNet.")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--val_frac", type=float, default=0.1,
+                        help="Fraction of the training set held out as a "
+                             "validation split for calibration/placement-probe/"
+                             "budget-search/sweep tuning (never the test set).")
 
     # Model
     parser.add_argument("--model", default="resnet18", choices=["resnet18", "resnet50"])
@@ -1694,10 +1777,11 @@ def main():
 
     logger = Logger(log_dir=args.log_dir)
 
-    trainloader, testloader, num_classes, input_shape = get_loaders(args)
+    trainloader, valloader, testloader, num_classes, input_shape = get_loaders(args)
 
     if args.channels_last and device.type == "cuda":
         trainloader = _channels_last_loader(trainloader)
+        valloader   = _channels_last_loader(valloader)
         testloader  = _channels_last_loader(testloader)
         print("[channels_last] DataLoaders wrapped for NHWC format.")
 
@@ -1739,7 +1823,7 @@ def main():
     # ---- Training -------------------------------------------------------
     if not args.eval_only:
         if args.joint_training:
-            train_joint(model, trainloader, testloader, device,
+            train_joint(model, trainloader, valloader, device,
                         epochs=args.epochs_joint,
                         lr=args.lr_joint,
                         exit_loss_weight=args.exit_loss_weight,
@@ -1749,7 +1833,7 @@ def main():
                         target_num_exits=len(args.exits),
                         probe_frac=args.placement_probe_frac)
         else:
-            train_backbone(model, trainloader, testloader, device,
+            train_backbone(model, trainloader, valloader, device,
                            epochs=args.epochs_backbone,
                            lr=args.lr_backbone,
                            logger=logger)
@@ -1759,6 +1843,14 @@ def main():
                                           T_start=args.T_start,
                                           T_end=args.T_end,
                                           logger=logger)
+
+        # Calibrate before gate training (not after) so collect_gate_data's
+        # gate features are computed from the same scaled probs the gate
+        # will see at inference (A2). No-op when --calibrate is off, since
+        # _get_temperature() defaults to T=1.0 either way.
+        if args.calibrate:
+            print("\n[Calibrate] Running per-exit temperature scaling...")
+            calibrate_temperature(model, valloader, device)
 
         gate_data = collect_gate_data(model, trainloader, device,
                                       max_batches=args.gate_max_batches,
@@ -1771,11 +1863,12 @@ def main():
 
         if args.checkpoint_dir:
             save_checkpoint(model, args.checkpoint_dir)
-
-    # ---- Temperature scaling calibration --------------------------------
-    if args.calibrate:
+    elif args.calibrate:
+        # eval_only + calibrate: calibrate the loaded checkpoint's heads
+        # without retraining anything (gates are untouched in this branch,
+        # same as before this change).
         print("\n[Calibrate] Running per-exit temperature scaling...")
-        calibrate_temperature(model, testloader, device)
+        calibrate_temperature(model, valloader, device)
         if args.checkpoint_dir:
             save_checkpoint(model, args.checkpoint_dir)
 
@@ -1795,7 +1888,7 @@ def main():
     gate_threshold = args.gate_threshold
     if args.compute_budget is not None and mac_profile is not None:
         gate_threshold = find_budget_threshold(
-            model, testloader, device,
+            model, valloader, device,
             target_budget=args.compute_budget,
             mac_profile=mac_profile,
         )
@@ -1805,10 +1898,10 @@ def main():
     dynamic_pts: List[Dict] = []
     if args.sweep:
         if args.policy in ("static", "both"):
-            static_pts = pareto_sweep(model, testloader, device, "static",
+            static_pts = pareto_sweep(model, valloader, device, "static",
                                       mac_profile=mac_profile)
         if args.policy in ("dynamic", "both"):
-            dynamic_pts = pareto_sweep(model, testloader, device, "dynamic",
+            dynamic_pts = pareto_sweep(model, valloader, device, "dynamic",
                                        mac_profile=mac_profile)
         if args.plot_dir:
             plot_pareto_curves(static_pts, dynamic_pts,
