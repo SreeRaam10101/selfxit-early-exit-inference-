@@ -1731,7 +1731,7 @@ def main():
                         logger=logger,
                         consistency_weight=args.consistency_weight)
         else:
-            train_backbone(model, trainloader, testloader, device,
+            train_backbone(model, trainloader, valloader, device,
                            epochs=args.epochs_backbone,
                            lr=args.lr_backbone,
                            logger=logger)
